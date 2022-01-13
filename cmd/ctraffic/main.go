@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,9 @@ import (
 
 	rndip "github.com/Nordix/mconnect/pkg/rndip/v2"
 	tcpinfo "github.com/brucespang/go-tcpinfo"
+	"github.com/pion/dtls/v2"
+	"github.com/pion/dtls/v2/examples/util"
+	"github.com/pion/dtls/v2/pkg/crypto/selfsign"
 	"golang.org/x/time/rate"
 
 	"golang.org/x/net/ipv4"
@@ -52,6 +56,7 @@ type config struct {
 	timeout   *time.Duration
 	monitor   *bool
 	udp       *bool
+	dtls      *bool
 	psize     *int
 	rate      *float64
 	reconnect *bool
@@ -85,6 +90,7 @@ func main() {
 	cmd.analyze = flag.String("analyze", "throughput", "Post-test analyze")
 	cmd.srccidr = flag.String("srccidr", "", "Source CIDR")
 	cmd.udp = flag.Bool("udp", false, "Use UDP")
+	cmd.dtls = flag.Bool("dtls", false, "Use DTLS")
 
 	flag.Parse()
 	if len(os.Args) < 2 {
@@ -108,10 +114,16 @@ func main() {
 		if *cmd.udp {
 			go cmd.udpServerMain()
 		}
+		if *cmd.dtls {
+			go cmd.dtlsServerMain()
+		}
 		os.Exit(cmd.serverMain())
 	} else {
 		if *cmd.udp {
 			os.Exit(cmd.udpClientMain())
+		}
+		if *cmd.dtls {
+			os.Exit(cmd.dtlsClientMain())
 		}
 		os.Exit(cmd.clientMain())
 	}
@@ -332,8 +344,8 @@ func (c *config) copyStats(s *statistics) {
 			cs.Received = cd.nPacketsReceived
 			cs.Dropped = cd.nPacketsDropped
 			if cd.tcpinfo != nil {
-				cs.Retransmits = cd.tcpinfo.Total_retrans
-				s.Retransmits += cd.tcpinfo.Total_retrans
+				// cs.Retransmits = cd.tcpinfo.Total_retrans
+				// s.Retransmits += cd.tcpinfo.Total_retrans
 			}
 			cs.Local = cd.local
 			cs.Remote = cd.remote
@@ -344,7 +356,7 @@ func (c *config) copyStats(s *statistics) {
 		for i = 0; i < nConn; i++ {
 			cd := &cData[i]
 			if cd.tcpinfo != nil {
-				s.Retransmits += cd.tcpinfo.Total_retrans
+				// s.Retransmits += cd.tcpinfo.Total_retrans
 			}
 		}
 		s.Samples = nil
@@ -547,7 +559,7 @@ func (c *config) serverMain() int {
 		log.Fatal(err)
 	}
 	defer l.Close()
-	log.Println("Listen on address; ", *c.addr)
+	log.Println("Listen on address (TCP); ", *c.addr)
 
 	for {
 		conn, err := l.Accept()
@@ -718,7 +730,112 @@ func (c *config) udpServerMain() int {
 	return 0
 }
 
+// ----------------------------------------------------------------------
+// DTLS
+
+func (c *config) dtlsServerMain() int {
+	// Generate a certificate and private key to secure the connection
+	certificate, genErr := selfsign.GenerateSelfSigned()
+	fmt.Println("Generating self-signed certificate")
+	fmt.Printf("%+v", certificate)
+
+	util.Check(genErr)
+
+	// Create parent context to cleanup handshaking connections on exit.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Prepare the configuration of the DTLS connection
+	config := &dtls.Config{
+		Certificates:         []tls.Certificate{certificate},
+		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		// Create timeout context for accepted connection.
+		ConnectContextMaker: func() (context.Context, func()) {
+			return context.WithTimeout(ctx, 30*time.Second)
+		},
+	}
+
+	serverAddr, err := net.ResolveUDPAddr("udp", *c.addr)
+	fmt.Println(serverAddr)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Connect to a DTLS server
+	listener, err := dtls.Listen("udp", serverAddr, config)
+	fmt.Println(listener)
+	fmt.Println(err)
+	util.Check(err)
+	defer func() {
+		util.Check(listener.Close())
+	}()
+
+	log.Println("Listen on DTLS (UDP) address; ", *c.addr)
+
+	// Simulate a chat session
+	hub := NewEchoServer()
+
+	for {
+		// Wait for a connection.
+		conn, err := listener.Accept()
+		fmt.Println(err)
+		util.Check(err)
+		// defer conn.Close() // TODO: graceful shutdown
+
+		// `conn` is of type `net.Conn` but may be casted to `dtls.Conn`
+		// using `dtlsConn := conn.(*dtls.Conn)` in order to to expose
+		// functions like `ConnectionState` etc.
+
+		// Register the connection with the chat hub
+		if err == nil {
+			hub.Register(conn)
+		}
+	}
+
+	return 0
+}
+
 func (c *config) udpClientMain() int {
+	s := newStats(*c.timeout, *c.rate, *c.nconn, uint32(*c.psize))
+	rand.Seed(time.Now().UnixNano())
+
+	// The connection array will not contain re-connects for UDP
+	cData = make([]connData, *c.nconn)
+
+	deadline := time.Now().Add(*c.timeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	if *c.srccidr != "" {
+		var err error
+		c.rndip, err = rndip.New(*c.srccidr)
+		if err != nil {
+			log.Fatal("Set source failed:", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(*c.nconn)
+	for i := 0; i < *c.nconn; i++ {
+		go c.udpClient(ctx, &wg, s)
+	}
+
+	if *c.monitor {
+		go monitor(s)
+	}
+
+	wg.Wait()
+
+	if *c.stats != "none" {
+		c.copyStats(s)
+		s.reportStats()
+	}
+
+	return 0
+}
+
+func (c *config) dtlsClientMain() int {
 	s := newStats(*c.timeout, *c.rate, *c.nconn, uint32(*c.psize))
 	rand.Seed(time.Now().UnixNano())
 
@@ -760,6 +877,11 @@ func (c *config) udpClientMain() int {
 type udpConn struct {
 	cd   *connData
 	conn *net.UDPConn
+}
+
+type dtlsConn struct {
+	cd   *connData
+	conn *dtls.Conn
 }
 
 func (c *config) udpClient(
