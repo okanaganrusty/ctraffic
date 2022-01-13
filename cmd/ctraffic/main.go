@@ -66,6 +66,7 @@ type config struct {
 	analyze   *string
 	srccidr   *string
 	rndip     *rndip.Rndip
+	sni       *string
 }
 
 func main() {
@@ -91,6 +92,7 @@ func main() {
 	cmd.srccidr = flag.String("srccidr", "", "Source CIDR")
 	cmd.udp = flag.Bool("udp", false, "Use UDP")
 	cmd.dtls = flag.Bool("dtls", false, "Use DTLS")
+	cmd.sni = flag.String("sni", "ctraffic.foobar.xyz", "Set the SNI value in the DTLS client hello")
 
 	flag.Parse()
 	if len(os.Args) < 2 {
@@ -1035,6 +1037,7 @@ func (c *config) dtlsClient(
 		config := &dtls.Config{
 			InsecureSkipVerify:   true,
 			ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+			ServerName:           *c.sni,
 		}
 
 		conn, err := dtls.Dial("udp", daddr, config)
