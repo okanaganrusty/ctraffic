@@ -857,7 +857,7 @@ func (c *config) dtlsClientMain() int {
 	var wg sync.WaitGroup
 	wg.Add(*c.nconn)
 	for i := 0; i < *c.nconn; i++ {
-		go c.udpClient(ctx, &wg, s)
+		go c.dtlsClient(ctx, &wg, s)
 	}
 
 	if *c.monitor {
@@ -975,6 +975,121 @@ func (c *udpConn) Run(ctx context.Context, s *statistics) error {
 			return err
 		}
 		_, _, err := c.conn.ReadFrom(p)
+		if err != nil {
+			// Probably a timeout, i.e. a lost packet
+			continue
+		}
+
+		if c.cd.nPacketsReceived == 0 {
+			// First received packet _may_ contain a hostname
+			if n := bytes.IndexByte(p, 0); n > 0 {
+				c.cd.host = string(p[:n])
+			}
+		}
+
+		c.cd.nPacketsReceived++
+		s.received(1)
+	}
+	return nil
+}
+
+func (c *config) dtlsClient(
+	ctx context.Context, wg *sync.WaitGroup, s *statistics) {
+	defer wg.Done()
+
+	for {
+
+		// Check that we have > 1sec until deadline
+		deadline, _ := ctx.Deadline()
+		if deadline.Sub(time.Now()) < 1*time.Second {
+			return
+		}
+
+		// Initiate a new connection
+		id := atomic.AddUint32(&nConn, 1) - 1
+		if int(id) >= len(cData) {
+			log.Fatal("Too many re-connects", id)
+		}
+		cd := &cData[id]
+		cd.id = id
+		cd.started = time.Now()
+		cd.psize = *c.psize
+		cd.rate = *c.rate / float64(*c.nconn)
+		var saddr *net.UDPAddr
+		if c.rndip != nil {
+			var err error
+			sadr := fmt.Sprintf("%s:0", c.rndip.GetIPString())
+			if saddr, err = net.ResolveUDPAddr("udp", sadr); err != nil {
+				log.Fatal(err)
+			} else {
+				cd.localAddr = saddr
+			}
+		}
+
+		daddr, err := net.ResolveUDPAddr("udp", *c.addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Prepare the configuration of the DTLS connection
+		config := &dtls.Config{
+			InsecureSkipVerify:   true,
+			ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		}
+
+		conn, err := dtls.Dial("udp", daddr, config)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer conn.Close()
+		cd.connected = time.Now()
+
+		dConnection := dtlsConn{cd, conn}
+		cd.err = dConnection.Run(ctx, s)
+		if cd.err == nil {
+			// NOTE: The connection *will* stop prematurely if the
+			// next packet can't be sent before the dead-line. However
+			// the stasistics should show that the connection exists
+			// to the test end.
+			cd.ended = s.Started.Add(s.Duration)
+			return // OK return
+		}
+		cd.ended = time.Now()
+	}
+}
+
+func (c *dtlsConn) Run(ctx context.Context, s *statistics) error {
+	defer c.conn.Close()
+
+	c.cd.local = c.conn.LocalAddr().String()
+	c.cd.remote = c.conn.RemoteAddr().String()
+
+	lim := newLimiter(ctx, c.cd.rate, c.cd.psize)
+	if lim == nil {
+		return nil
+	}
+
+	p := make([]byte, c.cd.psize)
+	for {
+		if lim.WaitN(ctx, c.cd.psize) != nil {
+			break
+		}
+
+		if _, err := c.conn.Write(p); err != nil {
+			return err
+		}
+		c.cd.sent++
+		s.sent(1)
+
+		for lim.AllowN(time.Now(), c.cd.psize) {
+			c.cd.nPacketsDropped++
+			s.dropped(1)
+		}
+
+		if err := c.conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			return err
+		}
+		_, err := c.conn.Read(p)
 		if err != nil {
 			// Probably a timeout, i.e. a lost packet
 			continue
